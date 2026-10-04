@@ -289,7 +289,7 @@ def word_limit_eval(model, tokenizer, rows, s, n_samples=1):
 
 # ------------------------------------------------------------ orchestration
 def evaluate_adapter(cfg, adapter, name, tokenizer, reward_bundle, beta=None, stratified=False,
-                     do_pairs=True, do_generation=True, max_gen_prompts=200, max_pairs=None,
+                     do_pairs=True, do_generation=True, max_gen_prompts=300, max_pairs=None,
                      eval_batch_size=4, stratum_key=None, wl_samples=1):
     tokenizer.truncation_side = "left"   # only used by the fallback path; the normal path never cuts the template
     s = settings(cfg, eval_batch_size)
@@ -344,7 +344,7 @@ def main():
     ap.add_argument("--adapter", default=None, help="adapter dir, or 'base' for the untouched model")
     ap.add_argument("--name", default="standard")
     ap.add_argument("--beta", type=float, default=None)
-    ap.add_argument("--max-gen-prompts", type=int, default=200)
+    ap.add_argument("--max-gen-prompts", type=int, default=300)
     ap.add_argument("--max-pairs", type=int, default=None)
     ap.add_argument("--eval-batch-size", type=int, default=4)
     ap.add_argument("--stratified", action="store_true")
