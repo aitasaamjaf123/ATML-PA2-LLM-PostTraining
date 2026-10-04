@@ -114,12 +114,96 @@ def stratified_pair_metrics(model, tokenizer, rows, s, stratum_key):
 
 
 # ------------------------------------------------------------ B: generation metrics
+RM_MAX_LENGTH = 1024                       # default max_length of common.generation.score_reward_pairs (right-truncating)
+ASSISTANT_MARKER = "<|im_start|>assistant\n"  # end of the Qwen chat template with add_generation_prompt=True
+TRUNC_MARK = "\n[...]\n"                    # inserted where the middle of an over-long user message was removed
+HEAD_FRAC = 0.5                            # fixed before looking at any result
+
+
+def _n_ids(x):
+    return len(x["input_ids"]) if hasattr(x, "keys") else len(x)
+
+
+def _n_prompt_tokens(tokenizer, msgs):
+    return _n_ids(tokenizer.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True))
+
+
+def truncate_prompt(tokenizer, messages, cap, head_frac=HEAD_FRAC):
+    """Keep the START and END of the last user message, drop the middle, re-render the chat template around it.
+    The system header and the assistant marker are therefore never cut.
+    Returns (messages, method) with method in {"none", "head_tail", "left_fallback"}."""
+    if _n_prompt_tokens(tokenizer, messages) <= cap:
+        return messages, "none"
+    ks = [i for i, m in enumerate(messages) if m.get("role") == "user"]
+    if not ks:
+        return messages, "left_fallback"
+    k = ks[-1]
+    ids = tokenizer(messages[k]["content"], add_special_tokens=False)["input_ids"]
+    overhead = _n_prompt_tokens(tokenizer, messages) - len(ids)
+    budget = cap - overhead - len(tokenizer(TRUNC_MARK, add_special_tokens=False)["input_ids"])
+    while budget >= 32:
+        h = int(budget * head_frac)
+        t = budget - h
+        head = tokenizer.decode(ids[:h]).rstrip("\ufffd")      # drop a half-decoded character at the seam
+        tail = tokenizer.decode(ids[-t:]).lstrip("\ufffd")
+        new = dict(messages[k]); new["content"] = head + TRUNC_MARK + tail
+        out = list(messages); out[k] = new
+        if _n_prompt_tokens(tokenizer, out) <= cap:
+            return out, "head_tail"
+        budget -= 8
+    return messages, "left_fallback"      # e.g. a very long earlier turn: batch_generate then left-truncates
+
+
+def prompt_trunc_info(tokenizer, rm_tok, orig, used, method, response, s):
+    """What generation-time truncation did to this prompt, and whether the reward-model input was cut."""
+    cap = s["max_prompt_length"]
+    full = _n_prompt_tokens(tokenizer, orig)
+    rendered = tokenizer.apply_chat_template(used, tokenize=False, add_generation_prompt=True)
+    kept_ids = tokenizer(rendered, truncation=True, max_length=cap)["input_ids"]   # same call batch_generate makes
+    rm_text = rm_tok.apply_chat_template(list(orig) + [{"role": "assistant", "content": response}],
+                                         tokenize=False, add_generation_prompt=False)
+    rm_len = len(rm_tok(rm_text)["input_ids"])
+    return {
+        "prompt_tokens_full": full,
+        "prompt_tokens_used": len(kept_ids),
+        "prompt_tokens_removed": max(0, full - len(kept_ids)),
+        "prompt_truncated": full > cap,
+        "prompt_truncation_method": method,
+        "prompt_marker_intact": tokenizer.decode(kept_ids[-6:]).endswith(ASSISTANT_MARKER),
+        "prompt_header_intact": tokenizer.decode(kept_ids[:3]).startswith("<|im_start|>"),
+        "rm_input_tokens": rm_len,
+        "rm_input_truncated": rm_len > RM_MAX_LENGTH,
+    }
+
+
+def summarize_prompt_trunc(records, s, tokenizer):
+    full = np.array([r["prompt_tokens_full"] for r in records], dtype=float)
+    removed = np.array([r["prompt_tokens_removed"] for r in records], dtype=float)
+    over = np.array([r["prompt_truncated"] for r in records], dtype=bool)
+    return {
+        "rule": f"head+tail on last user message (head_frac={HEAD_FRAC}); left-truncation fallback",
+        "fallback_truncation_side": tokenizer.truncation_side, "prompt_cap_tokens": s["max_prompt_length"],
+        "n_prompts": len(records), "n_over_cap": int(over.sum()), "frac_over_cap": float(over.mean()),
+        "methods": {m: int(sum(r["prompt_truncation_method"] == m for r in records))
+                    for m in ("none", "head_tail", "left_fallback")},
+        "prompt_tokens_full_p95": float(np.percentile(full, 95)), "prompt_tokens_full_max": int(full.max()),
+        "tokens_removed_mean_over_truncated": float(removed[over].mean()) if over.any() else 0.0,
+        "tokens_removed_max": int(removed.max()),
+        "n_assistant_marker_intact": int(sum(r["prompt_marker_intact"] for r in records)),
+        "n_system_header_intact": int(sum(r["prompt_header_intact"] for r in records)),
+        "reward_input_cap_tokens": RM_MAX_LENGTH,
+        "n_reward_input_over_cap": int(sum(r["rm_input_truncated"] for r in records)),
+    }
+
+
 def generate_eval(model, tokenizer, rm, rm_tok, prompts, ids, s):
     bs = s["eval_batch_size"]
     records, kl_num, kl_den = [], 0.0, 0.0
     for i in range(0, len(prompts), bs):
         chunk = prompts[i:i + bs]
-        out = batch_generate(model, tokenizer, chunk, s["max_prompt_length"], s["max_new_tokens"],
+        trunc = [truncate_prompt(tokenizer, m, s["max_prompt_length"]) for m in chunk]
+        gen_chunk, methods = [t[0] for t in trunc], [t[1] for t in trunc]
+        out = batch_generate(model, tokenizer, gen_chunk, s["max_prompt_length"], s["max_new_tokens"],
                              temperature=s["temperature"], top_p=s["top_p"], do_sample=s["do_sample"])
         with torch.no_grad():
             args = (out["sequences"], out["attention_mask"], out["prompt_width"], out["response_ids"])
@@ -133,7 +217,9 @@ def generate_eval(model, tokenizer, rm, rm_tok, prompts, ids, s):
         seq_kl = ((pol_lp - ref_lp) * mask).sum(-1).tolist()
         rewards = score_reward_pairs(rm, rm_tok, chunk, out["responses"]).tolist()
         for j in range(len(chunk)):
+            pinfo = prompt_trunc_info(tokenizer, rm_tok, chunk[j], gen_chunk[j], methods[j], out["responses"][j], s)
             records.append({
+                **pinfo,
                 "prompt_id": ids[i + j], "prompt": user_text(chunk[j]), "response": out["responses"][j],
                 "length_tokens": out["response_lengths"][j], "length_words": word_count(out["responses"][j]),
                 "reward": rewards[j], "kl_seq_sum": seq_kl[j],
@@ -150,6 +236,7 @@ def generate_eval(model, tokenizer, rm, rm_tok, prompts, ids, s):
         "length_iqr": float(np.percentile(L, 75) - np.percentile(L, 25)),
         "frac_hit_cap_no_eos": float(np.mean([r["hit_cap_no_eos"] for r in records])),
         "corr_length_reward": safe_corr(L, R),
+        "prompt_truncation": summarize_prompt_trunc(records, s, tokenizer),
     }
     return summary, records
 
@@ -204,7 +291,9 @@ def word_limit_eval(model, tokenizer, rows, s, n_samples=1):
 def evaluate_adapter(cfg, adapter, name, tokenizer, reward_bundle, beta=None, stratified=False,
                      do_pairs=True, do_generation=True, max_gen_prompts=200, max_pairs=None,
                      eval_batch_size=4, stratum_key=None, wl_samples=1):
+    tokenizer.truncation_side = "left"   # only used by the fallback path; the normal path never cuts the template
     s = settings(cfg, eval_batch_size)
+    s["prompt_truncation"] = f"head+tail on last user message (head_frac={HEAD_FRAC}), left-truncation fallback"
     beta = float(cfg["beta"] if beta is None else beta)
     out_dir = f"{cfg['results_dir']}/{name}"
     rm, rm_tok = reward_bundle
