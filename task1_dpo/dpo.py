@@ -25,5 +25,5 @@ def dpo_loss(
     return loss, {
         "logit_mean": logits.detach().mean(),
         "policy_margin_mean": policy_margin.detach().mean(),
-        "preference_accuracy": (policy_margin > 0).float().mean().detach(),
+        "preference_accuracy": (policy_margin - ref_margin > 0).float().mean().detach(),
     }
