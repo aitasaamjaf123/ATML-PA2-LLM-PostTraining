@@ -87,10 +87,9 @@ def cached_stage(config_path: str):
         attn = torch.ones_like(seq)
         resp = torch.tensor([r_ids], device=device)
         with torch.no_grad():
-            lp, _ = U.response_logprobs(policy, seq, attn, resp, temperature=0.7)
+            lp, _ = U.response_logprobs(policy, seq, attn, resp)
             with reference_mode(policy):
-                rlp, _ = U.response_logprobs(policy, seq, attn, resp, temperature=0.7)
-
+                rlp, _ = U.response_logprobs(policy, seq, attn, resp)
         new_lp_l.append(lp[0].float().cpu())
         ref_new_l.append(rlp[0].float().cpu())
         kept.append(row)

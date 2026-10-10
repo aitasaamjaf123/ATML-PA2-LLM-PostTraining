@@ -120,33 +120,20 @@ def microbatches(n: int, size: int):
     return [slice(i, min(i + size, n)) for i in range(0, n, size)]
 
 
-LOGPROB_TEMPERATURE = 1.0  # logits are divided by this before log-softmax (set from cfg["logprob_temperature"])
-
-
-def set_logprob_temperature(t: float) -> None:
-    global LOGPROB_TEMPERATURE
-    LOGPROB_TEMPERATURE = float(t)
-
-
-def _lp(lg, lb, T=1.0):
+def _lp(lg, lb):
     lg = lg.float()
-    if T != 1.0:
-        lg = lg / T
     return lg.gather(-1, lb.unsqueeze(-1)).squeeze(-1) - torch.logsumexp(lg, -1)
 
 
-def _lp_ent(lg, lb, T=1.0):
+def _lp_ent(lg, lb):
     lg = lg.float()
-    if T != 1.0:
-        lg = lg / T
     lse = torch.logsumexp(lg, -1)
     lp = lg.gather(-1, lb.unsqueeze(-1)).squeeze(-1) - lse
     ent = lse - (torch.softmax(lg, -1) * lg).sum(-1)
     return lp, ent
 
 
-def response_logprobs(model, sequences, attention_mask, response_ids, entropy: bool = False, chunk: int = 128,
-                      temperature: float | None = None):
+def response_logprobs(model, sequences, attention_mask, response_ids, entropy: bool = False, chunk: int = 128):
     """Per-token log pi(a_t|s_t) over the response (raw T=1 logits, as in the released helper).
 
     Only the last R+1 logit positions are materialised, and the float32 log-softmax is computed in
@@ -154,7 +141,6 @@ def response_logprobs(model, sequences, attention_mask, response_ids, entropy: b
     full. Returns (logp [B,R], entropy [B,R] or None). Entropy is the exact full-distribution entropy
     and is only computed outside autograd.
     """
-    T = LOGPROB_TEMPERATURE if temperature is None else float(temperature)
     R = response_ids.shape[1]
     kwargs = dict(input_ids=sequences, attention_mask=attention_mask, use_cache=False, return_dict=True)
     try:
@@ -168,12 +154,12 @@ def response_logprobs(model, sequences, attention_mask, response_ids, entropy: b
     for s in range(0, R, chunk):
         lg, lb = logits[:, s:s + chunk], response_ids[:, s:s + chunk]
         if entropy:
-            lp, en = _lp_ent(lg, lb, T)
+            lp, en = _lp_ent(lg, lb)
             ents.append(en)
         elif use_ckpt:
-            lp = checkpoint(_lp, lg, lb, T, use_reentrant=False)
+            lp = checkpoint(_lp, lg, lb, use_reentrant=False)
         else:
-            lp = _lp(lg, lb, T)
+            lp = _lp(lg, lb)
         lps.append(lp)
     return torch.cat(lps, 1), (torch.cat(ents, 1) if entropy else None)
 
