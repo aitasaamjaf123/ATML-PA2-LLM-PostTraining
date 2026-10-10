@@ -16,3 +16,17 @@ output: outputs/task3_grpo/standard
 results_dir: results/task3_grpo
 group_cache: cached/grpo_k_cache.jsonl
 cache_generation_cap: 768
+
+# ---- Student additions (additive only; no provided value above is changed) ----
+micro_batch_size: 4            # halves automatically on CUDA OOM
+eval_batch_size: 8             # generation batch size for held-out evaluation
+eval_logp_batch_size: 4        # chunk size for no-grad log-prob passes
+informative_tol: 1.0e-6        # group std > tol  <=> informative
+informative_tol_strict: 1.0e-2 # sensitivity check
+n_bins: 3                      # difficulty bins (rank-based terciles of per-prompt mean reward)
+bootstrap_reps: 1000
+permutation_reps: 100
+analysis_seed: 6304
+probe_prompts: 16
+probe_seed: 6304
+normalization_seeds: [6304, 7304, 8304]
