@@ -23,8 +23,7 @@ LOGPROB_MB = 4           # sequences per log-prob forward pass
 
 def load_evaluation_bundle(config_path: str, adapter: str):
     cfg = load_yaml(config_path)
-    tok = load_tokenizer(cfg["base_model"])
-    tok.truncation_side = "left"
+    tok = load_tokenizer(cfg["base_model"])  # default truncation side (right) = release behaviour
     return {
         "cfg": cfg,
         "rows": read_jsonl(cfg["paths"]["rl_prompt_eval"]),
@@ -121,7 +120,7 @@ def evaluate_policy(bundle: dict, name: str, max_prompts: int = MAX_EVAL_PROMPTS
         "corr_reward_length": float(np.corrcoef(rew, length)[0, 1]) if rew.std() > 0 and length.std() > 0 else float("nan"),
         "decoding": {"temperature": cfg["generation"]["temperature"], "top_p": cfg["generation"]["top_p"],
                      "do_sample": cfg["generation"]["do_sample"], "max_new_tokens": max_new, "seed": eval_seed,
-                     "batch_size": batch_size},
+                     "batch_size": batch_size, "prompt_truncation_side": tok.truncation_side},
         "n_prompts_over_max_prompt_length": n_long,
         "prompt_ids": [r["prompt_id"] for r in records],
         "eval_wall_clock_s": time.perf_counter() - t0,

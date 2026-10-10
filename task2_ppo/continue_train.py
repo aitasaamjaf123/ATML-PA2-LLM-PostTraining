@@ -47,8 +47,7 @@ def prepare_ppo_continuation(config_path: str, overrides: dict | None = None):
         cfg.update(overrides)
     set_seed(int(cfg["seed"]))
 
-    tokenizer = load_tokenizer(cfg["base_model"])
-    tokenizer.truncation_side = "left"  # keep the generation prompt if a prompt exceeds max_prompt_length
+    tokenizer = load_tokenizer(cfg["base_model"])  # default truncation side (right) = release behaviour
 
     t0 = time.perf_counter()
     policy = load_policy(
@@ -62,7 +61,6 @@ def prepare_ppo_continuation(config_path: str, overrides: dict | None = None):
         train_mode=cfg.get("value_train_mode", "head_only"),
     )
     reward_model, reward_tokenizer = load_reward_model(cfg)
-    reward_tokenizer.truncation_side = "left"
 
     # Deliberate deviations from the config, documented in the report: LoRA dropout off (otherwise old and
     # new log-probs differ at update 0), trainable params in fp32 (fp16 AdamW is unstable).
@@ -304,7 +302,7 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
         "value_lora_lr": float(cfg["value_lora_learning_rate"]), "value_head_lr": float(cfg["value_head_learning_rate"]),
         "gamma": gamma, "gae_lambda": lam, "value_coef": value_coef, "max_grad_norm": max_gn,
         "max_response_length": int(cfg["max_response_length"]), "generation": cfg["generation"],
-        "log_ratio_clamp": LOG_RATIO_CLAMP, "grad_scaler_init": GRAD_SCALER_INIT, "lora_dropout_used": 0.0,
+        "log_ratio_clamp": LOG_RATIO_CLAMP, "prompt_truncation_side": tok.truncation_side, "grad_scaler_init": GRAD_SCALER_INIT, "lora_dropout_used": 0.0,
         "prompt_ids": [r_["prompt_id"] for r_ in schedule], "source_indices": [r_["source_index"] for r_ in schedule],
         "n_prompts_over_max_prompt_length": n_long,
         "load_time_s": bundle["load_time_s"], "loop_wall_clock_s": loop_s,
