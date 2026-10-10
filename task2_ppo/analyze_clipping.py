@@ -192,12 +192,19 @@ def cached_stage(config_path: str):
         surr1 = ratio * adv_w
         surr2 = ratio.clamp(1 - eps, 1 + eps) * adv_w
         binding = masked_mean((surr2 < surr1).float(), mask)  # tokens where the clipped branch is actually selected
+        affected = ((ratio < 1 - eps) | (ratio > 1 + eps)).float()
+        m_short = mask * (~long_rows).float().unsqueeze(1)   # prompts that fit in max_prompt_length: convention is unambiguous
+        m_long = mask * long_rows.float().unsqueeze(1)       # over-long prompts: depend on the truncation convention
         out[f"{float(eps):g}"] = {
             "l_clip": float(-loss_w), "policy_loss": float(loss_w), "l_clip_raw_adv": float(-loss_r),
             "affected_frac": float(frac), "frac_above": float(above), "frac_below": float(below),
             "binding_frac": float(binding),
+            "affected_frac_short_prompts": float(masked_mean(affected, m_short)),
+            "affected_frac_long_prompts": float(masked_mean(affected, m_long)),
         }
-        print(f"eps={eps} [{best}]: L_clip={-float(loss_w):.6f} affected={float(frac):.6f} binding={float(binding):.6f}", flush=True)
+        e_ = out[f"{float(eps):g}"]
+        print(f"eps={eps} [{best}]: L_clip={-float(loss_w):.6f} affected={float(frac):.6f} binding={float(binding):.6f} "
+              f"| short-prompt rows={e_['affected_frac_short_prompts']:.6f} long-prompt rows={e_['affected_frac_long_prompts']:.6f}", flush=True)
     U.write_json(f"{U.RESULTS_DIR}/clipping_cached.json", out)
     return out
 
