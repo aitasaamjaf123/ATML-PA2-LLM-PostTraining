@@ -11,7 +11,7 @@ import torch
 
 from common.data import load_yaml, prompt_messages, read_jsonl, repo_path
 from common.metrics import masked_mean
-from common.models import load_policy, load_tokenizer, reference_mode
+from common.models import load_policy, load_tokenizer, load_value_model, reference_mode
 from task2_ppo import utils as U
 from task2_ppo.ppo import compute_gae, normalize_advantages, ppo_policy_loss, shaped_rewards
 
@@ -46,17 +46,23 @@ def _pad(seqs, fill=0.0):
     return out
 
 
+def _mean_abs(a, b, mask):
+    return float(((a - b).abs() * mask).sum() / mask.sum())
+
+
 def cached_stage(config_path: str):
     """Single forward pass of the midpoint policy over the fixed cached batch; no weights are updated.
 
-    The cache stores no token ids, so each response is re-tokenised (+EOS if it terminated) and rows whose
-    token count disagrees with the cached log-prob length are dropped and reported.
+    The cache stores no token ids, so each response is re-tokenised (+EOS if it terminated). Because the
+    recomputed log-probs did not match the cache with left-truncated prompts, two conventions are compared
+    against the cached values (over-long prompts truncated on the left vs on the right; log-probs always on
+    raw T=1 logits) and the ratio table below uses whichever reproduces the cache best.
     """
     cfg = load_yaml(config_path)
     rows = load_cached_rollouts(cfg["cached_rollouts"])
     beta = float(cfg["kl_beta"])
+    L = int(cfg["max_prompt_length"])
     tok = load_tokenizer(cfg["base_model"])
-    tok.truncation_side = "left"
 
     lookup = {}
     for key in ("rl_prompt_train", "rl_prompt_eval"):
@@ -65,17 +71,23 @@ def cached_stage(config_path: str):
 
     policy = load_policy(cfg, adapter_path=cfg["paths"]["ppo_midpoint_policy"], trainable=False)
     U.set_lora_dropout_zero(policy)
+    vmodel = load_value_model(cfg, cfg["paths"]["ppo_midpoint_value"], train_mode="frozen")
+    (vmodel.score if hasattr(vmodel, "score") else vmodel.classifier).float()
     device = next(policy.parameters()).device
 
-    kept, skipped = [], []
-    new_lp_l, ref_new_l = [], []
+    sides = ("left", "right")  # which end of an over-long prompt (> max_prompt_length) is truncated
+    new_lp = {s: [] for s in sides}
+    ref_new = {s: [] for s in sides}
+    my_v = {"left": [], "right": []}
+    kept, skipped, info = [], [], []
+
     for row in rows:
         prow = lookup.get(row["prompt_id"])
         if prow is None:
             skipped.append({"prompt_id": row["prompt_id"], "reason": "prompt_id not found"})
             continue
         text = tok.apply_chat_template(prompt_messages(prow), tokenize=False, add_generation_prompt=True)
-        p_ids = tok(text, add_special_tokens=False)["input_ids"][-int(cfg["max_prompt_length"]):]
+        p_full = tok(text, add_special_tokens=False)["input_ids"]
         r_ids = tok(row["response"], add_special_tokens=False)["input_ids"]
         if row.get("terminated_with_eos", False):
             r_ids = r_ids + [tok.eos_token_id]
@@ -83,48 +95,94 @@ def cached_stage(config_path: str):
         if len(r_ids) != n_cached:
             skipped.append({"prompt_id": row["prompt_id"], "reason": f"token mismatch {len(r_ids)} vs {n_cached}"})
             continue
-        seq = torch.tensor([p_ids + r_ids], device=device)
-        attn = torch.ones_like(seq)
         resp = torch.tensor([r_ids], device=device)
         with torch.no_grad():
-            lp, _ = U.response_logprobs(policy, seq, attn, resp)
-            with reference_mode(policy):
-                rlp, _ = U.response_logprobs(policy, seq, attn, resp)
-        new_lp_l.append(lp[0].float().cpu())
-        ref_new_l.append(rlp[0].float().cpu())
+            for side in sides:
+                p_use = p_full[-L:] if side == "left" else p_full[:L]
+                seq = torch.tensor([p_use + r_ids], device=device)
+                attn = torch.ones_like(seq)
+                lp, _ = U.response_logprobs(policy, seq, attn, resp)
+                with reference_mode(policy):
+                    rlp, _ = U.response_logprobs(policy, seq, attn, resp)
+                new_lp[side].append(lp[0].float().cpu())
+                ref_new[side].append(rlp[0].float().cpu())
+                my_v[side].append(U.value_forward(vmodel, seq, attn, len(p_use), len(r_ids))[0].float().cpu())
         kept.append(row)
-
+        info.append({"prompt_id": row["prompt_id"], "prompt_len": len(p_full), "n_tokens": n_cached,
+                     "clipped_at_max": bool(row.get("clipped_at_max", False))})
+    del vmodel
     if not kept:
         raise RuntimeError("No cached rows could be aligned with their cached log-probs")
     print(f"cached rows used: {len(kept)}/{len(rows)}; skipped: {skipped}", flush=True)
 
-    new_lp = _pad(new_lp_l)
-    ref_new = _pad(ref_new_l)
     old_lp = _pad([r["old_logprobs"] for r in kept])
     ref_lp = _pad([r["ref_logprobs"] for r in kept])
     values = _pad([r["values"] for r in kept])
     mask = _pad([torch.ones(len(r["old_logprobs"])) for r in kept])
     task_r = torch.tensor([float(r["raw_terminal_reward"]) for r in kept])  # raw RM score (no EOS penalty, as in training)
+    long_rows = torch.tensor([i_["prompt_len"] > L for i_ in info])
 
+    # ---- which convention reproduces the cached log-probs?
+    alignment, padded_new, padded_ref = {}, {}, {}
+    for name in sides:
+        n_, r_ = _pad(new_lp[name]), _pad(ref_new[name])
+        padded_new[name], padded_ref[name] = n_, r_
+        per_row = [float(((n_[i] - old_lp[i]).abs() * mask[i]).sum() / mask[i].sum()) for i in range(len(kept))]
+        for i_, v in zip(info, per_row):
+            i_[f"abs_diff_{name}"] = v
+        alignment[name] = {
+            "policy_vs_cached_old_abs": _mean_abs(n_, old_lp, mask),
+            "ref_vs_cached_ref_abs": _mean_abs(r_, ref_lp, mask),
+            "policy_vs_cached_old_abs_long_prompts": _mean_abs(n_[long_rows], old_lp[long_rows], mask[long_rows]) if long_rows.any() else None,
+            "policy_vs_cached_old_abs_short_prompts": _mean_abs(n_[~long_rows], old_lp[~long_rows], mask[~long_rows]) if (~long_rows).any() else None,
+            "signed_mean_new_minus_old": float(((n_ - old_lp) * mask).sum() / mask.sum()),
+            "median_row_abs_diff": float(np.median(per_row)),
+        }
+        print(f"[align] {name:10s} policy|diff|={alignment[name]['policy_vs_cached_old_abs']:.5f} "
+              f"ref|diff|={alignment[name]['ref_vs_cached_ref_abs']:.5f} "
+              f"long-prompt rows={alignment[name]['policy_vs_cached_old_abs_long_prompts']} "
+              f"short-prompt rows={alignment[name]['policy_vs_cached_old_abs_short_prompts']}", flush=True)
+    best = min(alignment, key=lambda n: alignment[n]["policy_vs_cached_old_abs"])
+    best_side = "left" if best.endswith("left") else "right"
+    print(f"[align] best-matching convention: {best}", flush=True)
+
+    # ---- does my critic forward reproduce the cached values?
+    value_check = {}
+    for side in ("left", "right"):
+        mv = _pad(my_v[side])
+        valid_ = mask.bool()
+        value_check[side] = {"abs_diff": _mean_abs(mv, values, mask),
+                             "corr": float(np.corrcoef(mv[valid_].numpy(), values[valid_].numpy())[0, 1])}
+    print(f"[value check] my critic vs cached values: {value_check}", flush=True)
+
+    # ---- advantages from the cache (as in training: KL-shaped rewards, GAE, whitening)
+    new_best = padded_new[best]
     rewards = shaped_rewards(task_r, old_lp, ref_lp, mask, beta)
     adv_raw, returns = compute_gae(rewards, values, mask, gamma=float(cfg["gamma"]), lam=float(cfg["gae_lambda"]))
     adv_w = normalize_advantages(adv_raw, mask)
-
-    log_r = U.clamp_new_logp(new_lp, old_lp)
+    mc = torch.flip(torch.cumsum(torch.flip(rewards * mask, [1]), 1), [1]) * mask
+    log_r = U.clamp_new_logp(new_best, old_lp)
     valid = mask.bool()
-    rho = (new_lp - old_lp).exp()
+    rho = (new_best - old_lp).exp()
     ev, v_mean, ret_mean, v_corr = U.value_stats(values, returns, mask)
+    ev_mc, _, mc_mean, mc_corr = U.value_stats(values, mc, mask)
 
     out = {"meta": {
         "n_cached_rows": len(rows), "n_used": len(kept), "skipped": skipped, "kl_beta": beta,
-        "n_valid_tokens": int(mask.sum()), "n_clipped_at_max": int(sum(bool(r.get("clipped_at_max", False)) for r in kept)),
+        "n_valid_tokens": int(mask.sum()), "n_clipped_at_max": int(sum(i_["clipped_at_max"] for i_ in info)),
+        "n_prompts_over_max_prompt_length": int(long_rows.sum()),
+        "alignment": alignment, "best_convention": best, "ratio_table_convention": best,
         "ratio_mean": float(rho[valid].mean()), "ratio_min": float(rho[valid].min()), "ratio_max": float(rho[valid].max()),
-        "log_ratio_std": float((new_lp - old_lp)[valid].std()), "abs_log_ratio_mean": float((new_lp - old_lp).abs()[valid].mean()),
-        "ref_logp_abs_diff_mean": float((ref_new - ref_lp).abs()[valid].mean()),
-        "cached_critic_explained_variance": ev, "cached_value_mean": v_mean, "cached_return_mean": ret_mean,
+        "log_ratio_std": float((new_best - old_lp)[valid].std()), "abs_log_ratio_mean": float((new_best - old_lp).abs()[valid].mean()),
+        "ref_logp_abs_diff_mean": float((padded_ref[best] - ref_lp).abs()[valid].mean()),
+        "value_check": value_check,
+        "terminal_reward_mean": float(task_r.mean()),
+        "cached_critic_explained_variance": ev, "cached_value_mean": v_mean, "cached_lambda_return_mean": ret_mean,
         "cached_value_return_corr": v_corr,
+        "cached_critic_ev_vs_mc_return": ev_mc, "cached_mc_return_mean": mc_mean, "cached_value_mc_corr": mc_corr,
         "adv_whitened_mean": float(adv_w[valid].mean()), "adv_whitened_std": float(adv_w[valid].std(unbiased=False)),
-        "note": "theta == theta_old up to fp16 recomputation noise, so rho ~ 1 and the affected fraction is ~0 by construction",
+        "per_row": info,
+        "note": "if the best convention reproduces the cache (|diff| ~1e-3) then rho ~ 1 and the affected fraction ~ 0 by construction",
     }}
     for eps in cfg["clip_values"]:
         loss_w, ratio, frac = ppo_policy_loss(log_r, old_lp, adv_w, mask, eps=float(eps))
@@ -139,7 +197,7 @@ def cached_stage(config_path: str):
             "affected_frac": float(frac), "frac_above": float(above), "frac_below": float(below),
             "binding_frac": float(binding),
         }
-        print(f"eps={eps}: L_clip={-float(loss_w):.6f} affected={float(frac):.6f} binding={float(binding):.6f}", flush=True)
+        print(f"eps={eps} [{best}]: L_clip={-float(loss_w):.6f} affected={float(frac):.6f} binding={float(binding):.6f}", flush=True)
     U.write_json(f"{U.RESULTS_DIR}/clipping_cached.json", out)
     return out
 
